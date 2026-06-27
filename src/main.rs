@@ -159,16 +159,32 @@ impl WslController {
                     keep_alive.insert(distro.to_string(), child);
                 }
                 self.last_error = None;
+                self.last_action = format!("已接管 {distro} 后台保活");
+                self.refresh_distros();
+            }
+            Err(err) => self.fail(format!("保活 {distro} 失败：{err}")),
+        }
+    }
+
+    fn start_distro(&mut self, distro: &str) {
+        match hidden_wsl_command()
+            .args(["-d", distro, "--exec", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                self.last_error = None;
                 self.last_action = format!("已启动 {distro}");
                 self.refresh_distros();
             }
+            Ok(status) => self.fail(format!("启动 {distro} 失败，退出码：{status}")),
             Err(err) => self.fail(format!("启动 {distro} 失败：{err}")),
         }
     }
 
     fn open_shell_window(&mut self, distro: &str) {
-        self.start_keep_alive(distro);
-
         let title = format!("WSL - {distro}");
         let wt_result = Command::new("wt.exe")
             .args(["new-tab", "--title", &title, "wsl.exe", "-d", distro])
@@ -696,10 +712,15 @@ fn distro_card(ui: &mut egui::Ui, controller: &mut WslController, distro: &WslDi
                     {
                         controller.terminate_distro(&distro.name);
                     }
-                    if action_button(ui, "启动", ButtonTone::Neutral, "后台启动该发行版并保持运行")
+                    if action_button(ui, "保活", ButtonTone::Neutral, "接管该发行版并在后台保持运行")
                         .clicked()
                     {
                         controller.start_keep_alive(&distro.name);
+                    }
+                    if action_button(ui, "启动", ButtonTone::Neutral, "启动该发行版")
+                        .clicked()
+                    {
+                        controller.start_distro(&distro.name);
                     }
                     if action_button(ui, "Shell", ButtonTone::Primary, "打开该发行版 Shell")
                         .clicked()
