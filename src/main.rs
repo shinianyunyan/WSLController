@@ -6,9 +6,10 @@ use std::{
     os::windows::process::CommandExt,
     process::{Child, Command, Stdio},
     sync::{
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -93,18 +94,21 @@ impl WslState {
 struct WslController {
     distros: Vec<WslDistro>,
     keep_alive: SharedKeepAlive,
+    tasks: AsyncTasks,
     last_error: Option<String>,
     last_action: String,
     last_status_refresh: Instant,
 }
 
 type SharedKeepAlive = Arc<Mutex<HashMap<String, Child>>>;
+type AsyncTasks = Arc<Mutex<HashMap<String, bool>>>;
 
 impl WslController {
-    fn new(keep_alive: SharedKeepAlive) -> Self {
+    fn new(keep_alive: SharedKeepAlive, tasks: AsyncTasks) -> Self {
         let mut controller = Self {
             distros: Vec::new(),
             keep_alive,
+            tasks,
             last_error: None,
             last_action: String::new(),
             last_status_refresh: Instant::now(),
@@ -166,22 +170,73 @@ impl WslController {
         }
     }
 
-    fn start_distro(&mut self, distro: &str) {
-        match hidden_wsl_command()
-            .args(["-d", distro, "--exec", "true"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => {
-                self.last_error = None;
-                self.last_action = format!("已启动 {distro}");
-                self.refresh_distros();
-            }
-            Ok(status) => self.fail(format!("启动 {distro} 失败，退出码：{status}")),
-            Err(err) => self.fail(format!("启动 {distro} 失败：{err}")),
+    fn mark_task(&mut self, key: impl Into<String>, label: impl Into<String>) -> bool {
+        let key = key.into();
+        let already_running = self
+            .tasks
+            .lock()
+            .map(|mut tasks| {
+                if tasks.contains_key(&key) {
+                    true
+                } else {
+                    tasks.insert(key, true);
+                    false
+                }
+            })
+            .unwrap_or(true);
+
+        if already_running {
+            self.last_error = None;
+            self.last_action = format!("{} 正在执行", label.into());
+            return false;
         }
+
+        true
+    }
+
+    fn task_running(&self, key: &str) -> bool {
+        self.tasks
+            .lock()
+            .map(|tasks| tasks.contains_key(key))
+            .unwrap_or(false)
+    }
+
+    fn finish_task(tasks: &AsyncTasks, key: &str) {
+        if let Ok(mut tasks) = tasks.lock() {
+            tasks.remove(key);
+        }
+    }
+
+    fn start_distro(&mut self, distro: &str, sender: mpsc::Sender<AppEvent>) {
+        let key = format!("start:{distro}");
+        if !self.mark_task(key.clone(), format!("启动 {distro}")) {
+            return;
+        }
+
+        self.last_error = None;
+        self.last_action = format!("正在启动 {distro}");
+        let distro = distro.to_string();
+        let tasks = Arc::clone(&self.tasks);
+
+        thread::spawn(move || {
+            let result = hidden_wsl_command()
+                .args(["-d", &distro, "--exec", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|err| format!("启动 {distro} 失败：{err}"))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(format!("已启动 {distro}"))
+                    } else {
+                        Err(format!("启动 {distro} 失败，退出码：{status}"))
+                    }
+                });
+
+            Self::finish_task(&tasks, &key);
+            let _ = sender.send(AppEvent::TaskFinished(result));
+        });
     }
 
     fn open_shell_window(&mut self, distro: &str) {
@@ -208,44 +263,69 @@ impl WslController {
         }
     }
 
-    fn terminate_distro(&mut self, distro: &str) {
-        self.kill_keep_alive(distro);
-
-        match hidden_wsl_command()
-            .args(["--terminate", distro])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => {
-                self.last_error = None;
-                self.last_action = format!("已关闭 {distro}");
-                self.refresh_distros();
-            }
-            Ok(status) => self.fail(format!("关闭 {distro} 失败，退出码：{status}")),
-            Err(err) => self.fail(format!("关闭 {distro} 失败：{err}")),
+    fn terminate_distro(&mut self, distro: &str, sender: mpsc::Sender<AppEvent>) {
+        let key = format!("terminate:{distro}");
+        if !self.mark_task(key.clone(), format!("关闭 {distro}")) {
+            return;
         }
+
+        self.kill_keep_alive(distro);
+        self.last_error = None;
+        self.last_action = format!("正在关闭 {distro}");
+        let distro = distro.to_string();
+        let tasks = Arc::clone(&self.tasks);
+
+        thread::spawn(move || {
+            let result = hidden_wsl_command()
+                .args(["--terminate", &distro])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|err| format!("关闭 {distro} 失败：{err}"))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(format!("已关闭 {distro}"))
+                    } else {
+                        Err(format!("关闭 {distro} 失败，退出码：{status}"))
+                    }
+                });
+
+            Self::finish_task(&tasks, &key);
+            let _ = sender.send(AppEvent::TaskFinished(result));
+        });
     }
 
-    fn shutdown_all(&mut self) {
-        self.kill_all_keep_alive();
-
-        match hidden_wsl_command()
-            .arg("--shutdown")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => {
-                self.last_error = None;
-                self.last_action = "已关闭全部 WSL 发行版".to_string();
-                self.refresh_distros();
-            }
-            Ok(status) => self.fail(format!("关闭全部 WSL 失败，退出码：{status}")),
-            Err(err) => self.fail(format!("关闭全部 WSL 失败：{err}")),
+    fn shutdown_all(&mut self, sender: mpsc::Sender<AppEvent>) {
+        let key = "shutdown_all".to_string();
+        if !self.mark_task(key.clone(), "关闭全部 WSL") {
+            return;
         }
+
+        self.kill_all_keep_alive();
+        self.last_error = None;
+        self.last_action = "正在关闭全部 WSL".to_string();
+        let tasks = Arc::clone(&self.tasks);
+
+        thread::spawn(move || {
+            let result = hidden_wsl_command()
+                .arg("--shutdown")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|err| format!("关闭全部 WSL 失败：{err}"))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok("已关闭全部 WSL 发行版".to_string())
+                    } else {
+                        Err(format!("关闭全部 WSL 失败，退出码：{status}"))
+                    }
+                });
+
+            Self::finish_task(&tasks, &key);
+            let _ = sender.send(AppEvent::TaskFinished(result));
+        });
     }
 
     fn keep_alive_running(&self, distro: &str) -> bool {
@@ -399,6 +479,7 @@ impl TrayState {
 struct WslApp {
     controller: WslController,
     tray: Option<TrayState>,
+    sender: Sender<AppEvent>,
     events: Receiver<AppEvent>,
     should_quit: bool,
 }
@@ -406,6 +487,7 @@ struct WslApp {
 enum AppEvent {
     Tray(TrayIconEvent),
     Menu(MenuEvent),
+    TaskFinished(Result<String, String>),
 }
 
 impl WslApp {
@@ -424,6 +506,7 @@ impl WslApp {
         let tray = TrayState::new()?;
         let quit_id = tray.quit_id.clone();
         let menu_keep_alive = Arc::clone(&keep_alive);
+        let menu_sender = sender.clone();
         let menu_ctx = cc.egui_ctx.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id == quit_id {
@@ -431,13 +514,14 @@ impl WslApp {
                 std::process::exit(0);
             }
 
-            let _ = sender.send(AppEvent::Menu(event));
+            let _ = menu_sender.send(AppEvent::Menu(event));
             menu_ctx.request_repaint();
         }));
 
         Ok(Self {
-            controller: WslController::new(keep_alive),
+            controller: WslController::new(keep_alive, Arc::new(Mutex::new(HashMap::new()))),
             tray: Some(tray),
+            sender,
             events,
             should_quit: false,
         })
@@ -466,11 +550,21 @@ impl WslApp {
                     if event.id == tray.show_id {
                         Self::show_window(ctx);
                     } else if event.id == tray.shutdown_all_id {
-                        self.controller.shutdown_all();
+                        self.controller.shutdown_all(self.sender.clone());
                     } else if event.id == tray.quit_id {
                         self.controller.kill_all_keep_alive();
                         self.should_quit = true;
                     }
+                }
+                AppEvent::TaskFinished(result) => {
+                    match result {
+                        Ok(message) => {
+                            self.controller.last_error = None;
+                            self.controller.last_action = message;
+                        }
+                        Err(message) => self.controller.fail(message),
+                    }
+                    self.controller.refresh_distros();
                 }
             }
         }
@@ -498,7 +592,7 @@ impl App for WslApp {
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     header(ui, &self.controller);
                     ui.add_space(18.0);
-                    distro_list(ui, &mut self.controller);
+                    distro_list(ui, &mut self.controller, self.sender.clone());
                     ui.add_space(12.0);
                     status_line(ui, &self.controller);
                 });
@@ -605,7 +699,7 @@ fn overview_pill(ui: &mut egui::Ui, controller: &WslController) {
         });
 }
 
-fn distro_list(ui: &mut egui::Ui, controller: &mut WslController) {
+fn distro_list(ui: &mut egui::Ui, controller: &mut WslController, sender: Sender<AppEvent>) {
     let max_width = (ui.available_width() - 24.0).max(480.0);
 
     Frame::new()
@@ -641,7 +735,7 @@ fn distro_list(ui: &mut egui::Ui, controller: &mut WslController) {
                     .show(ui, |ui| {
                         let distros = controller.distros.clone();
                         for distro in distros {
-                            distro_card(ui, controller, &distro);
+                            distro_card(ui, controller, &distro, sender.clone());
                             ui.add_space(10.0);
                         }
                     });
@@ -665,8 +759,23 @@ fn empty_state(ui: &mut egui::Ui) {
         });
 }
 
-fn distro_card(ui: &mut egui::Ui, controller: &mut WslController, distro: &WslDistro) {
+fn distro_card(
+    ui: &mut egui::Ui,
+    controller: &mut WslController,
+    distro: &WslDistro,
+    sender: Sender<AppEvent>,
+) {
     let keep_alive = controller.keep_alive_running(&distro.name);
+    let start_label = if controller.task_running(&format!("start:{}", distro.name)) {
+        "启动中"
+    } else {
+        "启动"
+    };
+    let close_label = if controller.task_running(&format!("terminate:{}", distro.name)) {
+        "关闭中"
+    } else {
+        "关闭"
+    };
 
     Frame::new()
         .fill(Color32::from_rgb(29, 34, 44))
@@ -704,23 +813,23 @@ fn distro_card(ui: &mut egui::Ui, controller: &mut WslController, distro: &WslDi
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if action_button(
                         ui,
-                        "关闭",
+                        close_label,
                         ButtonTone::Danger,
                         "终止该发行版和对应保活进程",
                     )
                     .clicked()
                     {
-                        controller.terminate_distro(&distro.name);
+                        controller.terminate_distro(&distro.name, sender.clone());
                     }
                     if action_button(ui, "保活", ButtonTone::Neutral, "接管该发行版并在后台保持运行")
                         .clicked()
                     {
                         controller.start_keep_alive(&distro.name);
                     }
-                    if action_button(ui, "启动", ButtonTone::Neutral, "启动该发行版")
+                    if action_button(ui, start_label, ButtonTone::Neutral, "启动该发行版")
                         .clicked()
                     {
-                        controller.start_distro(&distro.name);
+                        controller.start_distro(&distro.name, sender.clone());
                     }
                     if action_button(ui, "Shell", ButtonTone::Primary, "打开该发行版 Shell")
                         .clicked()
