@@ -159,7 +159,7 @@ impl WslController {
                     keep_alive.insert(distro.to_string(), child);
                 }
                 self.last_error = None;
-                self.last_action = format!("已启动 {distro} 的后台保活");
+                self.last_action = format!("已启动 {distro}");
                 self.refresh_distros();
             }
             Err(err) => self.fail(format!("启动 {distro} 失败：{err}")),
@@ -671,7 +671,7 @@ fn distro_card(ui: &mut egui::Ui, controller: &mut WslController, distro: &WslDi
                             small_tag(ui, "默认");
                         }
                         if keep_alive {
-                            small_tag(ui, "后台保活");
+                            small_tag(ui, "保活中");
                         }
                     });
                     ui.add_space(4.0);
@@ -696,7 +696,7 @@ fn distro_card(ui: &mut egui::Ui, controller: &mut WslController, distro: &WslDi
                     {
                         controller.terminate_distro(&distro.name);
                     }
-                    if action_button(ui, "保活", ButtonTone::Neutral, "启动隐藏后台保活进程")
+                    if action_button(ui, "启动", ButtonTone::Neutral, "后台启动该发行版并保持运行")
                         .clicked()
                     {
                         controller.start_keep_alive(&distro.name);
