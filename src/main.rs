@@ -26,6 +26,9 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const KEEP_ALIVE_COMMAND: &str =
@@ -375,6 +378,22 @@ fn kill_all_keep_alive(keep_alive: &SharedKeepAlive) {
     }
 }
 
+fn show_main_window() {
+    let title: Vec<u16> = "WSLController"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd != std::ptr::null_mut() {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 fn hidden_wsl_command() -> Command {
     let mut command = Command::new("wsl.exe");
     command.creation_flags(CREATE_NO_WINDOW);
@@ -504,6 +523,7 @@ impl WslApp {
         }));
 
         let tray = TrayState::new()?;
+        let show_id = tray.show_id.clone();
         let quit_id = tray.quit_id.clone();
         let menu_keep_alive = Arc::clone(&keep_alive);
         let menu_sender = sender.clone();
@@ -512,6 +532,9 @@ impl WslApp {
             if event.id == quit_id {
                 kill_all_keep_alive(&menu_keep_alive);
                 std::process::exit(0);
+            }
+            if event.id == show_id {
+                show_main_window();
             }
 
             let _ = menu_sender.send(AppEvent::Menu(event));
@@ -535,6 +558,7 @@ impl WslApp {
     fn show_window(ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
+        show_main_window();
     }
 
     fn handle_app_events(&mut self, ctx: &egui::Context) {
