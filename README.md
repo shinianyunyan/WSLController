@@ -15,22 +15,10 @@
 ## 构建
 
 ```powershell
-cargo build --release
-```
-
-生成文件：
-
-```text
-target\release\wsl_controller.exe
-```
-
-也可以运行：
-
-```powershell
 .\build-release.ps1
 ```
 
-脚本会额外生成发布文件：
+生成文件：
 
 ```text
 dist\WSLController.exe
