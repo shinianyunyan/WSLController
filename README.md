@@ -30,9 +30,15 @@ target\release\wsl_controller.exe
 .\build-release.ps1
 ```
 
+脚本会额外生成发布文件：
+
+```text
+dist\WSLController.exe
+```
+
 ## 使用
 
-1. 启动 `target\release\wsl_controller.exe`。
+1. 启动 `dist\WSLController.exe`。
 2. 在列表里选择对应发行版，点击 `启动` 会启动该发行版。
 3. 点击 `保活` 会由 WSLController 接管该发行版，并在后台保持运行。
 4. 点击 `Shell` 打开可见终端窗口。
